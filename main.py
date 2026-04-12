@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 import logging
 import mimetypes
+import signal
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
@@ -36,6 +37,12 @@ from telethon.tl.types import (
 import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
+
+# Local rate limiter for DELETE operations only (protection against account blocks)
+from rate_limiter import (
+    delete_rate_limited,
+    get_rate_limit_status,
+)
 
 
 class ValidationError(Exception):
@@ -105,10 +112,57 @@ try:
     logger.addHandler(file_handler)
     logger.info(f"Logging initialized to {log_file_path}")
 except Exception as log_error:
-    print(f"WARNING: Error setting up log file: {log_error}")
+    print(f"WARNING: Error setting up log file: {log_error}", file=sys.stderr)
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+
+# === Auto-reconnection logic ===
+
+async def ensure_connected():
+    """Ensure the Telethon client is connected. Reconnect if needed."""
+    if not client.is_connected():
+        print("Telegram client disconnected. Reconnecting...", file=sys.stderr)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                raise ConnectionError(
+                    "Telegram session expired. Regenerate with: "
+                    "python session_string_generator.py"
+                )
+            print("Telegram client reconnected successfully.", file=sys.stderr)
+        except ConnectionError:
+            raise
+        except Exception as e:
+            raise ConnectionError(f"Failed to reconnect to Telegram: {e}")
+
+
+def auto_reconnect(func):
+    """Decorator to ensure Telegram connection before tool calls."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        await ensure_connected()
+        try:
+            return await func(*args, **kwargs)
+        except ConnectionError:
+            # One retry after reconnection
+            await ensure_connected()
+            return await func(*args, **kwargs)
+    return wrapper
+
+
+async def _keepalive():
+    """Periodic connection check to prevent idle disconnection."""
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        try:
+            if not client.is_connected():
+                print("Keepalive: reconnecting...", file=sys.stderr)
+                await client.connect()
+                print("Keepalive: reconnected.", file=sys.stderr)
+        except Exception as e:
+            print(f"Keepalive: reconnection failed: {e}", file=sys.stderr)
 
 
 # Error code prefix mapping for better error tracing
@@ -335,6 +389,7 @@ def get_engagement_info(message) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
+@auto_reconnect
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
     Get a paginated list of chats.
@@ -362,6 +417,7 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
     """
     Get paginated messages from a specific chat.
@@ -399,6 +455,7 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     annotations=ToolAnnotations(title="Send Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def send_message(chat_id: Union[int, str], message: str) -> str:
     """
     Send a message to a specific chat.
@@ -513,6 +570,7 @@ async def list_inline_buttons(
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def press_inline_button(
     chat_id: Union[int, str],
     message_id: Optional[Union[int, str]] = None,
@@ -629,6 +687,7 @@ async def press_inline_button(
 @mcp.tool(
     annotations=ToolAnnotations(title="List Contacts", openWorldHint=True, readOnlyHint=True)
 )
+@auto_reconnect
 async def list_contacts() -> str:
     """
     List all contacts in your Telegram account.
@@ -704,6 +763,7 @@ async def get_contact_ids() -> str:
     annotations=ToolAnnotations(title="List Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def list_messages(
     chat_id: Union[int, str],
     limit: int = 20,
@@ -915,6 +975,7 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
+@auto_reconnect
 async def list_chats(chat_type: str = None, limit: int = 20) -> str:
     """
     List available chats with metadata.
@@ -988,6 +1049,7 @@ async def list_chats(chat_type: str = None, limit: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chat", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def get_chat(chat_id: Union[int, str]) -> str:
     """
     Get detailed information about a specific chat.
@@ -1377,6 +1439,7 @@ async def delete_contact(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@auto_reconnect
 async def block_user(user_id: Union[int, str]) -> str:
     """
     Block a user by user ID.
@@ -1397,6 +1460,7 @@ async def block_user(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@auto_reconnect
 async def unblock_user(user_id: Union[int, str]) -> str:
     """
     Unblock a user by user ID.
@@ -1412,6 +1476,7 @@ async def unblock_user(user_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Me", openWorldHint=True, readOnlyHint=True))
+@auto_reconnect
 async def get_me() -> str:
     """
     Get your own user information.
@@ -1544,6 +1609,7 @@ async def invite_to_group(group_id: Union[int, str], user_ids: List[Union[int, s
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def leave_chat(chat_id: Union[int, str]) -> str:
     """
     Leave a group or channel by chat ID.
@@ -1627,6 +1693,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Participants", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def get_participants(chat_id: Union[int, str]) -> str:
     """
     List all participants in a group or channel.
@@ -1646,6 +1713,7 @@ async def get_participants(chat_id: Union[int, str]) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def send_file(chat_id: Union[int, str], file_path: str, caption: str = None) -> str:
     """
     Send a file to a chat.
@@ -2377,6 +2445,7 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
         title="Join Chat By Link", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@auto_reconnect
 async def join_chat_by_link(link: str) -> str:
     """
     Join a chat by invite link.
@@ -2558,6 +2627,7 @@ async def send_voice(chat_id: Union[int, str], file_path: str) -> str:
     annotations=ToolAnnotations(title="Forward Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("from_chat_id", "to_chat_id")
+@auto_reconnect
 async def forward_message(
     from_chat_id: Union[int, str], message_id: int, to_chat_id: Union[int, str]
 ) -> str:
@@ -2585,6 +2655,7 @@ async def forward_message(
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str) -> str:
     """
     Edit a message you sent.
@@ -2605,6 +2676,8 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
+@delete_rate_limited
 async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Delete a message by ID.
@@ -2623,6 +2696,7 @@ async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Pin a message in a chat.
@@ -2641,6 +2715,7 @@ async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Unpin a message in a chat.
@@ -2659,6 +2734,7 @@ async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def mark_as_read(chat_id: Union[int, str]) -> str:
     """
     Mark all messages as read in a chat.
@@ -2675,6 +2751,7 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Reply To Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def reply_to_message(chat_id: Union[int, str], message_id: int, text: str) -> str:
     """
     Reply to a specific message in a chat.
@@ -2731,6 +2808,7 @@ async def search_public_chats(query: str) -> str:
     annotations=ToolAnnotations(title="Search Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
     Search for messages in a chat by text.
@@ -3105,6 +3183,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get History", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
     Get full chat history (up to limit).
@@ -3195,6 +3274,7 @@ async def get_recent_actions(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Pinned Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def get_pinned_messages(chat_id: Union[int, str]) -> str:
     """
     Get all pinned messages in a chat.
@@ -3568,6 +3648,7 @@ async def get_drafts() -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def clear_draft(chat_id: Union[int, str]) -> str:
     """
     Clear/delete a draft from a specific chat.
@@ -3592,13 +3673,68 @@ async def clear_draft(chat_id: Union[int, str]) -> str:
         return log_and_format_error("clear_draft", e, chat_id=chat_id)
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Rate Limit Status", openWorldHint=False, readOnlyHint=True
+    )
+)
+async def rate_limit_status() -> str:
+    """
+    Get current delete rate limiting status.
+
+    Shows how many delete operations have been performed in the last minute.
+    Rate limiting only applies to DELETE operations to protect against account blocks.
+
+    When limit is reached, operations automatically WAIT and continue (never fail).
+    """
+    try:
+        status = await get_rate_limit_status()
+
+        lines = ["📊 Delete Rate Limit Status:", ""]
+
+        lines.append(f"Deletes last minute: {status['deletes_last_minute']}/{status['limit_per_minute']} ({status['percent_used']})")
+        lines.append("")
+        lines.append(f"Session stats:")
+        lines.append(f"  Total deletes: {status['total_deletes_session']}")
+        lines.append(f"  Total waits: {status['total_waits_session']}")
+        lines.append("")
+        lines.append(f"Config:")
+        lines.append(f"  Max {status['config']['deletes_per_minute']} deletes/min")
+        lines.append(f"  {status['config']['delete_delay']}s delay between deletes")
+        lines.append(f"  Max {status['config']['max_batch_size']} items per batch")
+        lines.append("")
+        lines.append("Note: Rate limiting waits automatically, never fails.")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting rate limit status: {e}"
+
+
+async def _graceful_shutdown():
+    """Disconnect Telethon client cleanly on exit."""
+    try:
+        if client.is_connected():
+            print("Shutting down Telegram client...", file=sys.stderr)
+            await client.disconnect()
+            print("Telegram client disconnected.", file=sys.stderr)
+    except Exception as e:
+        print(f"Error during shutdown: {e}", file=sys.stderr)
+
+
 async def _main() -> None:
     try:
+        # Register signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: loop.create_task(_graceful_shutdown()))
+
         # Start the Telethon client non-interactively
-        print("Starting Telegram client...")
+        print("Starting Telegram client...", file=sys.stderr)
         await client.start()
 
-        print("Telegram client started. Running MCP server...")
+        print("Telegram client started. Running MCP server...", file=sys.stderr)
+        # Start keepalive task to prevent idle disconnection
+        asyncio.create_task(_keepalive())
         # Use the asynchronous entrypoint instead of mcp.run()
         await mcp.run_stdio_async()
     except Exception as e:
@@ -3609,6 +3745,8 @@ async def _main() -> None:
                 file=sys.stderr,
             )
         sys.exit(1)
+    finally:
+        await _graceful_shutdown()
 
 
 def main() -> None:
