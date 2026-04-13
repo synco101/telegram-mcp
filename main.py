@@ -3728,15 +3728,20 @@ async def _main() -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: loop.create_task(_graceful_shutdown()))
 
-        # Start the Telethon client non-interactively
-        print("Starting Telegram client...", file=sys.stderr)
-        await client.start()
+        # Start MCP stdio handler concurrently with Telethon client so the MCP
+        # `initialize` handshake is never blocked behind the MTProto connect.
+        # Tools that require Telethon check `client.is_connected()` themselves.
+        async def _start_client() -> None:
+            print("Starting Telegram client...", file=sys.stderr)
+            await client.start()
+            print("Telegram client started.", file=sys.stderr)
+            asyncio.create_task(_keepalive())
 
-        print("Telegram client started. Running MCP server...", file=sys.stderr)
-        # Start keepalive task to prevent idle disconnection
-        asyncio.create_task(_keepalive())
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        print("Running MCP server (Telegram client connecting in background)...", file=sys.stderr)
+        await asyncio.gather(
+            _start_client(),
+            mcp.run_stdio_async(),
+        )
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
