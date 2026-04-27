@@ -79,6 +79,10 @@ else:
     # Use file-based session
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
+# Signaled when client.start() finishes successfully — gates RPC handlers
+# so they don't double-connect during concurrent startup (see _main).
+client_ready = asyncio.Event()
+
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
 logger.setLevel(logging.ERROR)  # Set to ERROR for production, INFO for debugging
@@ -121,21 +125,40 @@ except Exception as log_error:
 # === Auto-reconnection logic ===
 
 async def ensure_connected():
-    """Ensure the Telethon client is connected. Reconnect if needed."""
-    if not client.is_connected():
-        print("Telegram client disconnected. Reconnecting...", file=sys.stderr)
+    """Ensure the Telethon client is connected. Reconnect if needed.
+
+    Uses the `client_ready` event to avoid double-connecting during concurrent
+    startup: if `client.start()` is still in flight, wait for it instead of
+    issuing a parallel `client.connect()` (which deadlocks).
+    """
+    # Fast path: already connected
+    if client.is_connected():
+        return
+
+    # Startup phase: wait for `client.start()` to finish (with timeout)
+    if not client_ready.is_set():
         try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                raise ConnectionError(
-                    "Telegram session expired. Regenerate with: "
-                    "python session_string_generator.py"
-                )
-            print("Telegram client reconnected successfully.", file=sys.stderr)
-        except ConnectionError:
-            raise
-        except Exception as e:
-            raise ConnectionError(f"Failed to reconnect to Telegram: {e}")
+            await asyncio.wait_for(client_ready.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise ConnectionError("Telegram client startup timeout (10s)")
+        return
+
+    # Post-startup reconnect path
+    print("Telegram client disconnected. Reconnecting...", file=sys.stderr)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=5.0)
+        if not await client.is_user_authorized():
+            raise ConnectionError(
+                "Telegram session expired. Regenerate with: "
+                "python session_string_generator.py"
+            )
+        print("Telegram client reconnected successfully.", file=sys.stderr)
+    except asyncio.TimeoutError:
+        raise ConnectionError("Telegram reconnect timeout (5s)")
+    except ConnectionError:
+        raise
+    except Exception as e:
+        raise ConnectionError(f"Failed to reconnect to Telegram: {e}")
 
 
 def auto_reconnect(func):
@@ -3734,6 +3757,7 @@ async def _main() -> None:
         async def _start_client() -> None:
             print("Starting Telegram client...", file=sys.stderr)
             await client.start()
+            client_ready.set()  # unblock RPC handlers waiting in ensure_connected
             print("Telegram client started.", file=sys.stderr)
             asyncio.create_task(_keepalive())
 
