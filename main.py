@@ -38,9 +38,11 @@ import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
 
-# Local rate limiter for DELETE operations only (protection against account blocks)
+# Local rate limiters: DELETE (aggressive) + GET (defense-in-depth)
+# See rate_limiter.py docstring for strategy.
 from rate_limiter import (
     delete_rate_limited,
+    get_rate_limited,
     get_rate_limit_status,
 )
 
@@ -412,6 +414,7 @@ def get_engagement_info(message) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
+@get_rate_limited
 @auto_reconnect
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
@@ -440,6 +443,7 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@get_rate_limited
 @auto_reconnect
 async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
     """
@@ -786,6 +790,7 @@ async def get_contact_ids() -> str:
     annotations=ToolAnnotations(title="List Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 @auto_reconnect
 async def list_messages(
     chat_id: Union[int, str],
@@ -998,6 +1003,7 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
+@get_rate_limited
 @auto_reconnect
 async def list_chats(chat_type: str = None, limit: int = 20) -> str:
     """
@@ -1311,6 +1317,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Message Context", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 async def get_message_context(
     chat_id: Union[int, str], message_id: int, context_size: int = 3
 ) -> str:
@@ -1716,6 +1723,7 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Participants", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 @auto_reconnect
 async def get_participants(chat_id: Union[int, str]) -> str:
     """
@@ -1763,6 +1771,7 @@ async def send_file(chat_id: Union[int, str], file_path: str, caption: str = Non
     annotations=ToolAnnotations(title="Download Media", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 async def download_media(chat_id: Union[int, str], message_id: int, file_path: str) -> str:
     """
     Download media from a message in a chat.
@@ -2831,6 +2840,7 @@ async def search_public_chats(query: str) -> str:
     annotations=ToolAnnotations(title="Search Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 @auto_reconnect
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
@@ -3206,6 +3216,7 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get History", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@get_rate_limited
 @auto_reconnect
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
@@ -3712,21 +3723,43 @@ async def rate_limit_status() -> str:
     """
     try:
         status = await get_rate_limit_status()
+        d = status["delete"]
+        g = status["get"]
 
-        lines = ["📊 Delete Rate Limit Status:", ""]
+        lines = ["📊 Rate Limit Status (DELETE + GET)", ""]
 
-        lines.append(f"Deletes last minute: {status['deletes_last_minute']}/{status['limit_per_minute']} ({status['percent_used']})")
+        lines.append("--- DELETE (aggressive, account-protection) ---")
+        lines.append(
+            f"Last minute: {d['deletes_last_minute']}/{d['limit_per_minute']} "
+            f"({d['percent_used']})"
+        )
+        lines.append(
+            f"Session: {d['total_deletes_session']} deletes, "
+            f"{d['total_waits_session']} waits"
+        )
+        lines.append(
+            f"Config: max {d['config']['deletes_per_minute']}/min, "
+            f"{d['config']['delete_delay']}s between, "
+            f"batch {d['config']['max_batch_size']}"
+        )
         lines.append("")
-        lines.append(f"Session stats:")
-        lines.append(f"  Total deletes: {status['total_deletes_session']}")
-        lines.append(f"  Total waits: {status['total_waits_session']}")
-        lines.append("")
-        lines.append(f"Config:")
-        lines.append(f"  Max {status['config']['deletes_per_minute']} deletes/min")
-        lines.append(f"  {status['config']['delete_delay']}s delay between deletes")
-        lines.append(f"  Max {status['config']['max_batch_size']} items per batch")
+
+        lines.append("--- GET (defense-in-depth, runaway-loop guard) ---")
+        lines.append(
+            f"Last minute: {g['calls_last_minute']}/{g['limit_per_minute']} "
+            f"({g['percent_used']})"
+        )
+        lines.append(
+            f"Session: {g['total_calls_session']} calls, "
+            f"{g['total_waits_session']} waits"
+        )
+        lines.append(
+            f"Config: max {g['config']['calls_per_minute']}/min, "
+            f"approach delay {g['config']['approach_delay']}s"
+        )
         lines.append("")
         lines.append("Note: Rate limiting waits automatically, never fails.")
+        lines.append("Telethon FloodWaitError is the primary defense for reads.")
 
         return "\n".join(lines)
     except Exception as e:

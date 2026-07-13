@@ -1,6 +1,11 @@
 """
-Rate Limiter for Telegram MCP Server - DELETE operations only.
-Protects against account blocks due to excessive delete operations.
+Rate Limiter for Telegram MCP Server.
+
+Protects against account blocks due to excessive operations:
+- DELETE: aggressive limit (10/min) — historically what caused FloodWait/bans
+- GET (reads): defense-in-depth limit (30/min) — preemptive cap. Primary defense
+  for reads is Telethon's built-in FloodWaitError handling (flood_sleep_threshold);
+  this layer just prevents obviously runaway loops.
 
 Strategy: Wait and continue, never fail.
 If limit reached -> pause -> continue when allowed.
@@ -127,16 +132,155 @@ class DeleteRateLimiter:
             }
 
 
-# Global instance
+# =====================================================================
+# GET (read) operations — defense-in-depth preemptive throttle.
+# Telethon's FloodWaitError handling is the primary defense; this is a
+# safety net that catches runaway loops before they trigger Telegram-side
+# rate limits.
+# =====================================================================
+
+
+@dataclass
+class GetRateLimitConfig:
+    """Configuration for read-operation rate limiting."""
+    # Soft cap. Telegram doesn't publish exact limits; 30/min is conservative
+    # for typical interactive use. Heavy batch ops should respect FloodWaitError.
+    calls_per_minute: int = 30
+
+    # Tiny delay when approaching limit (much lower than DELETE since
+    # reads are cheap)
+    approach_delay: float = 0.3
+
+
+class GetRateLimiter:
+    """
+    Rate limiter for read operations (get_history, get_messages,
+    download_media, search_messages, list_chats, etc.).
+
+    Same NEVER-fail-only-wait contract as DeleteRateLimiter.
+    """
+
+    def __init__(self, config: Optional[GetRateLimitConfig] = None):
+        self.config = config or GetRateLimitConfig()
+        self._call_times: list = []
+        self._lock = asyncio.Lock()
+        self._total_calls = 0
+        self._total_waits = 0
+
+    def _cleanup_old_operations(self, window_seconds: int = 60) -> None:
+        cutoff = time.time() - window_seconds
+        self._call_times = [t for t in self._call_times if t > cutoff]
+
+    async def wait_if_needed(self) -> float:
+        """Block until a slot is available. Returns waited seconds."""
+        async with self._lock:
+            self._cleanup_old_operations()
+
+            current_count = len(self._call_times)
+            limit = self.config.calls_per_minute
+
+            if current_count >= limit:
+                if self._call_times:
+                    oldest = min(self._call_times)
+                    wait_time = max(0, (oldest + 60) - time.time() + 0.5)
+                else:
+                    wait_time = 1.0
+
+                logger.info(
+                    f"GET rate limit reached ({current_count}/{limit}). "
+                    f"Waiting {wait_time:.1f}s..."
+                )
+                self._total_waits += 1
+
+                self._lock.release()
+                try:
+                    await asyncio.sleep(wait_time)
+                finally:
+                    await self._lock.acquire()
+
+                self._cleanup_old_operations()
+                return wait_time
+
+            elif current_count >= limit * 0.8:
+                wait_time = self.config.approach_delay
+                logger.debug(
+                    f"GET approaching limit ({current_count}/{limit}). "
+                    f"Small delay {wait_time}s"
+                )
+                self._lock.release()
+                try:
+                    await asyncio.sleep(wait_time)
+                finally:
+                    await self._lock.acquire()
+                return wait_time
+
+            return 0
+
+    async def record_call(self) -> None:
+        async with self._lock:
+            self._call_times.append(time.time())
+            self._total_calls += 1
+
+    async def get_status(self) -> dict:
+        async with self._lock:
+            self._cleanup_old_operations()
+            return {
+                "calls_last_minute": len(self._call_times),
+                "limit_per_minute": self.config.calls_per_minute,
+                "percent_used": f"{len(self._call_times) / self.config.calls_per_minute * 100:.0f}%",
+                "total_calls_session": self._total_calls,
+                "total_waits_session": self._total_waits,
+                "config": {
+                    "calls_per_minute": self.config.calls_per_minute,
+                    "approach_delay": self.config.approach_delay,
+                },
+            }
+
+
+# Global instances
 _rate_limiter: Optional[DeleteRateLimiter] = None
+_get_rate_limiter: Optional[GetRateLimiter] = None
 
 
 def get_rate_limiter() -> DeleteRateLimiter:
-    """Get or create the global rate limiter instance."""
+    """Get or create the global DELETE rate limiter instance."""
     global _rate_limiter
     if _rate_limiter is None:
         _rate_limiter = DeleteRateLimiter()
     return _rate_limiter
+
+
+def get_get_rate_limiter() -> GetRateLimiter:
+    """Get or create the global GET rate limiter instance."""
+    global _get_rate_limiter
+    if _get_rate_limiter is None:
+        _get_rate_limiter = GetRateLimiter()
+    return _get_rate_limiter
+
+
+def get_rate_limited(func):
+    """
+    Decorator for read operations (get_history, download_media, etc.).
+
+    Defense-in-depth: throttles preemptively to ~30 calls/min so
+    runaway LLM loops can't burn through Telegram's hidden rate limits.
+    Telethon's FloodWaitError handling remains the primary defense.
+
+    Usage:
+        @get_rate_limited
+        async def get_history(...):
+            ...
+    """
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        limiter = get_get_rate_limiter()
+        wait_time = await limiter.wait_if_needed()
+        if wait_time > 0:
+            logger.info(f"Resumed after {wait_time:.1f}s GET wait")
+        result = await func(*args, **kwargs)
+        await limiter.record_call()
+        return result
+    return wrapper
 
 
 def delete_rate_limited(func):
@@ -237,5 +381,8 @@ async def delete_messages_batch(
 
 
 async def get_rate_limit_status() -> dict:
-    """Get current rate limiting status."""
-    return await get_rate_limiter().get_status()
+    """Get current rate limiting status — combined DELETE + GET."""
+    return {
+        "delete": await get_rate_limiter().get_status(),
+        "get": await get_get_rate_limiter().get_status(),
+    }
