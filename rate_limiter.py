@@ -11,6 +11,7 @@ Strategy: Wait and continue, never fail.
 If limit reached -> pause -> continue when allowed.
 """
 
+import sys
 import time
 import asyncio
 from functools import wraps
@@ -19,6 +20,20 @@ from dataclasses import dataclass
 import logging
 
 logger = logging.getLogger("telegram_mcp.rate_limiter")
+
+
+def announce_wait(kind: str, count: int, limit: int, seconds: float) -> None:
+    """Say out loud that we are throttling.
+
+    Not via `logger`: the parent `telegram_mcp` logger AND its handlers both sit at
+    ERROR, so info/warning records are dropped. A tool that silently sleeps is
+    indistinguishable from a hung one — which is the exact confusion this server
+    already cost us once. stderr is where the rest of the server talks.
+    """
+    print(
+        f"{kind} rate limit reached ({count}/{limit}) — throttling {seconds:.1f}s.",
+        file=sys.stderr,
+    )
 
 
 @dataclass
@@ -78,34 +93,23 @@ class DeleteRateLimiter:
                 else:
                     wait_time = self.config.cooldown_pause
 
-                logger.info(f"Rate limit reached ({current_count}/{limit}). Waiting {wait_time:.1f}s...")
                 self._total_waits += 1
-
-                # Release lock during wait
-                self._lock.release()
-                try:
-                    await asyncio.sleep(wait_time)
-                finally:
-                    await self._lock.acquire()
-
-                # Cleanup again after wait
-                self._cleanup_old_operations()
-                return wait_time
+                announce_wait("DELETE", current_count, limit, wait_time)
 
             # If approaching limit (80%), add small delay
             elif current_count >= limit * 0.8:
                 wait_time = self.config.delete_delay
-                logger.debug(f"Approaching limit ({current_count}/{limit}). Small delay {wait_time}s")
 
-                self._lock.release()
-                try:
-                    await asyncio.sleep(wait_time)
-                finally:
-                    await self._lock.acquire()
+            else:
+                return 0
 
-                return wait_time
-
-            return 0
+        # Sleep OUTSIDE the lock. The previous form released the lock inside its own
+        # `async with`, slept, and re-acquired in a `finally` — juggling ownership
+        # across an await that the MCP client cancels at 30s. It survives the simple
+        # case, but nothing about it is guaranteed under contention, and it is far
+        # more code than just not holding the lock while sleeping.
+        await asyncio.sleep(wait_time)
+        return wait_time
 
     async def record_delete(self) -> None:
         """Record that a delete operation was performed."""
@@ -143,13 +147,21 @@ class DeleteRateLimiter:
 @dataclass
 class GetRateLimitConfig:
     """Configuration for read-operation rate limiting."""
-    # Soft cap. Telegram doesn't publish exact limits; 30/min is conservative
-    # for typical interactive use. Heavy batch ops should respect FloodWaitError.
-    calls_per_minute: int = 30
+    # This is a runaway-loop guard, not a tax on normal use. A human session reads
+    # a few dozen times; a runaway agent reads hundreds. 30/min was low enough that
+    # one ordinary chat sweep would trip it and stall real work — set the bar where
+    # only genuinely pathological behaviour hits it. Telethon's FloodWaitError
+    # remains the primary defense (see module docstring).
+    calls_per_minute: int = 100
 
     # Tiny delay when approaching limit (much lower than DELETE since
     # reads are cheap)
     approach_delay: float = 0.3
+
+    # Hard ceiling on any single throttle sleep. The MCP client gives up on a tool
+    # after 30s of silence, so sleeping longer throttles nothing and merely looks
+    # like a hang.
+    max_wait: float = 20.0
 
 
 class GetRateLimiter:
@@ -186,35 +198,24 @@ class GetRateLimiter:
                 else:
                     wait_time = 1.0
 
-                logger.info(
-                    f"GET rate limit reached ({current_count}/{limit}). "
-                    f"Waiting {wait_time:.1f}s..."
-                )
+                # Never out-wait the caller. The MCP client aborts a tool after 30s of
+                # silence, so a longer sleep doesn't throttle anything — it just
+                # reproduces the 30s "hang" this server was broken by. Throttle hard,
+                # but stay answerable.
+                wait_time = min(wait_time, self.config.max_wait)
+
                 self._total_waits += 1
-
-                self._lock.release()
-                try:
-                    await asyncio.sleep(wait_time)
-                finally:
-                    await self._lock.acquire()
-
-                self._cleanup_old_operations()
-                return wait_time
+                announce_wait("GET", current_count, limit, wait_time)
 
             elif current_count >= limit * 0.8:
                 wait_time = self.config.approach_delay
-                logger.debug(
-                    f"GET approaching limit ({current_count}/{limit}). "
-                    f"Small delay {wait_time}s"
-                )
-                self._lock.release()
-                try:
-                    await asyncio.sleep(wait_time)
-                finally:
-                    await self._lock.acquire()
-                return wait_time
 
-            return 0
+            else:
+                return 0
+
+        # Sleep outside the lock — see DeleteRateLimiter.wait_if_needed.
+        await asyncio.sleep(wait_time)
+        return wait_time
 
     async def record_call(self) -> None:
         async with self._lock:

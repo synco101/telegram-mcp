@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import fcntl
 import asyncio
 import sqlite3
 import logging
@@ -81,9 +82,105 @@ else:
     # Use file-based session
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
-# Signaled when client.start() finishes successfully — gates RPC handlers
-# so they don't double-connect during concurrent startup (see _main).
+# === Session ownership (single-instance guard) ===
+#
+# Claude Code spawns one stdio MCP process per editor window, and every one of them
+# loads the same TELEGRAM_SESSION_STRING. Two Telethon clients sharing one auth key
+# make Telegram revoke that key *permanently* (AuthKeyDuplicatedError) — which is
+# exactly what killed this server in 2026-04. An exclusive flock lets only the first
+# process own the session. The kernel drops the lock when that process dies, so the
+# next window takes over on its own and there is no stale lock to clean up.
+STATE_DIR = os.path.expanduser("~/.cache/telegram-mcp")
+LOCK_PATH = os.path.join(STATE_DIR, "session.lock")
+HEALTH_PATH = os.path.join(STATE_DIR, "health.json")
+
+_lock_file = None  # held open for the process lifetime; closing it frees the lock
+session_owner = False  # True only in the process holding the lock
+lock_holder_pid = None  # who owns it, so a loser can name them in its error
+
+# Released once startup settles — successfully OR not. It must never be left unset:
+# a handler waiting on an event that never fires is what turned a dead session into
+# a silent 30s hang on every tool for three months.
 client_ready = asyncio.Event()
+startup_error: Optional[Exception] = None
+
+SESSION_INVALID_MESSAGE = (
+    "Telegram session is invalid or revoked. Regenerate it:\n"
+    "  cd 00-core/mcp-servers/telegram && uv run python session_string_generator.py\n"
+    "then put the new value in TELEGRAM_SESSION_STRING (.env) and restart the editor."
+)
+
+
+def actionable(e: Exception) -> Exception:
+    """Attach the remedy to auth failures — the raw cause never says what to do.
+
+    Matched on the class name rather than imported classes: the auth error zoo
+    (AuthKeyDuplicated / AuthKeyUnregistered / SessionRevoked / SessionExpired)
+    moves between Telethon versions, and a stale import would silently stop matching.
+    """
+    name = type(e).__name__
+    if "AuthKey" in name or "Session" in name or "Unauthorized" in name:
+        return RuntimeError(f"{name}: {e}\n\n{SESSION_INVALID_MESSAGE}")
+    return e
+
+
+def not_owner_message() -> str:
+    return (
+        f"Telegram session is owned by another editor window (PID {lock_holder_pid}). "
+        "Telegram allows only one client per auth key — a second connection makes it "
+        "revoke the key permanently. Use Telegram in that window, or close it and "
+        "restart this one."
+    )
+
+
+def acquire_session_lock() -> None:
+    """Take the exclusive session lock if it is free, and record who holds it."""
+    global _lock_file, session_owner, lock_holder_pid
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _lock_file = os.fdopen(os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644), "r+")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        session_owner = False
+        _lock_file.seek(0)
+        lock_holder_pid = _lock_file.read().strip() or "unknown"
+        print(f"Telegram session owned by PID {lock_holder_pid}; "
+              "serving tools in read-only-error mode.", file=sys.stderr)
+        return
+
+    session_owner = True
+    lock_holder_pid = os.getpid()
+    _lock_file.seek(0)
+    _lock_file.truncate()
+    _lock_file.write(str(os.getpid()))
+    _lock_file.flush()
+
+
+def write_health(ok: bool, error: Optional[str] = None) -> None:
+    """Publish readiness so the SessionStart probe can tell 'idle' from 'broken'.
+
+    The probe classifies MCP servers by log mtime — which a server with dead auth
+    satisfies just as well as a healthy one. That blind spot is why this outage went
+    unnoticed for months. Only the session owner reports; the other windows are
+    disconnected by design and would otherwise raise false alarms.
+    """
+    if not session_owner:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(HEALTH_PATH, "w") as f:
+            json.dump(
+                {
+                    "ok": ok,
+                    "error": error,
+                    "pid": os.getpid(),
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+            )
+    except Exception as e:
+        print(f"WARNING: could not write health file: {e}", file=sys.stderr)
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -129,20 +226,32 @@ except Exception as log_error:
 async def ensure_connected():
     """Ensure the Telethon client is connected. Reconnect if needed.
 
-    Uses the `client_ready` event to avoid double-connecting during concurrent
-    startup: if `client.start()` is still in flight, wait for it instead of
-    issuing a parallel `client.connect()` (which deadlocks).
+    Fails fast and explains itself. Every path out of here either returns connected
+    or raises a ConnectionError a human can act on — never blocks indefinitely.
     """
+    # We don't hold the session lock: never open a second MTProto connection on the
+    # same auth key. That is the precise thing that got the key revoked.
+    if not session_owner:
+        raise ConnectionError(not_owner_message())
+
     # Fast path: already connected
     if client.is_connected():
         return
 
-    # Startup phase: wait for `client.start()` to finish (with timeout)
+    # Startup phase: wait for startup to settle. It always settles — `_start_client`
+    # sets the event in a `finally`, success or failure.
     if not client_ready.is_set():
         try:
-            await asyncio.wait_for(client_ready.wait(), timeout=10.0)
+            await asyncio.wait_for(client_ready.wait(), timeout=30.0)
         except asyncio.TimeoutError:
-            raise ConnectionError("Telegram client startup timeout (10s)")
+            raise ConnectionError("Telegram client startup timeout (30s)")
+
+    # Startup settled but failed (revoked session, no network, ...). Say so now
+    # rather than letting the caller retry into a wall.
+    if startup_error is not None:
+        raise ConnectionError(str(startup_error))
+
+    if client.is_connected():
         return
 
     # Post-startup reconnect path
@@ -171,7 +280,10 @@ def auto_reconnect(func):
         try:
             return await func(*args, **kwargs)
         except ConnectionError:
-            # One retry after reconnection
+            # A retry only helps a dropped connection. If the session is unusable —
+            # revoked, or owned by another window — retrying just doubles the wait.
+            if not session_owner or startup_error is not None:
+                raise
             await ensure_connected()
             return await func(*args, **kwargs)
     return wrapper
@@ -3784,15 +3896,46 @@ async def _main() -> None:
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: loop.create_task(_graceful_shutdown()))
 
+        acquire_session_lock()
+
         # Start MCP stdio handler concurrently with Telethon client so the MCP
         # `initialize` handshake is never blocked behind the MTProto connect.
-        # Tools that require Telethon check `client.is_connected()` themselves.
         async def _start_client() -> None:
-            print("Starting Telegram client...", file=sys.stderr)
-            await client.start()
-            client_ready.set()  # unblock RPC handlers waiting in ensure_connected
-            print("Telegram client started.", file=sys.stderr)
-            asyncio.create_task(_keepalive())
+            """Connect Telethon, or record why we couldn't. Never raises.
+
+            Raising here would propagate through `asyncio.gather` and take the whole
+            MCP server down. Instead we record the failure, publish it, and release
+            `client_ready` so every tool reports it instantly.
+            """
+            global startup_error
+            try:
+                if not session_owner:
+                    raise RuntimeError(not_owner_message())
+
+                print("Starting Telegram client...", file=sys.stderr)
+                # connect(), never start(): start()'s default `phone=` is
+                # `lambda: input(...)`, and stdin here is the JSON-RPC pipe. An
+                # interactive prompt would block the event loop and corrupt the
+                # protocol stream — every tool, even ones that never touch Telegram.
+                await asyncio.wait_for(client.connect(), timeout=30.0)
+                if not await client.is_user_authorized():
+                    raise RuntimeError(SESSION_INVALID_MESSAGE)
+
+                print("Telegram client started.", file=sys.stderr)
+                write_health(ok=True)
+                asyncio.create_task(_keepalive())
+            except Exception as e:
+                startup_error = actionable(e)
+                write_health(ok=False, error=f"{type(e).__name__}: {e}")
+                print(
+                    "\n***** TELEGRAM MCP: NOT CONNECTED — ALL TELEGRAM TOOLS WILL FAIL *****\n"
+                    f"***** {type(e).__name__}: {e}\n"
+                    "**********************************************************************\n",
+                    file=sys.stderr,
+                )
+            finally:
+                # ALWAYS. A waiter that never wakes is what hid this for three months.
+                client_ready.set()
 
         print("Running MCP server (Telegram client connecting in background)...", file=sys.stderr)
         await asyncio.gather(
@@ -3806,7 +3949,14 @@ async def _main() -> None:
                 "Database lock detected. Please ensure no other instances are running.",
                 file=sys.stderr,
             )
-        sys.exit(1)
+        sys.stderr.flush()
+        await _graceful_shutdown()
+        # os._exit, never sys.exit. SystemExit cannot kill this process: interpreter
+        # shutdown blocks forever in threading._shutdown() joining anyio's non-daemon
+        # stdin workers, leaving a zombie whose event loop is dead but whose pipe is
+        # still open — so the MCP client goes on believing the server is healthy and
+        # every tool call just times out. That zombie was the three-month outage.
+        os._exit(1)
     finally:
         await _graceful_shutdown()
 
