@@ -3,6 +3,7 @@ import sys
 import json
 import time
 import fcntl
+import secrets
 import asyncio
 import sqlite3
 import logging
@@ -72,6 +73,21 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
+
+# === Transport ===
+#
+# stdio (default) gives every editor window its OWN process — and Telegram revokes an
+# auth key the moment two clients share one session ("cannot be shared between multiple
+# clients, even on the same machine" — Telethon FAQ). So with stdio only one window can
+# hold Telegram at a time.
+#
+# `--http` runs this as a single shared daemon on localhost instead: ONE process, ONE
+# Telethon client, and every window connects to it as a client. Telegram works in all
+# windows at once and there is nothing left to duplicate.
+HTTP_MODE = "--http" in sys.argv
+HTTP_HOST = "127.0.0.1"  # localhost only — never bind 0.0.0.0, this speaks for his account
+HTTP_PORT = int(os.getenv("TELEGRAM_MCP_PORT", "8787"))
+MCP_TOKEN = os.getenv("TELEGRAM_MCP_TOKEN")
 
 mcp = FastMCP("telegram")
 
@@ -3907,12 +3923,51 @@ async def _on_signal() -> None:
     os._exit(0)
 
 
+async def _run_http() -> None:
+    """Serve MCP over localhost HTTP, so every editor window shares ONE Telethon client.
+
+    Mirrors FastMCP.run_streamable_http_async() — which builds the app internally and so
+    leaves no seam for middleware — with a bearer-token gate added. stdio is reachable
+    only by the process that spawned it; an open localhost port is reachable by anything
+    running on this machine, and these tools read and send his Telegram. The token is
+    not optional: refuse to serve rather than stand up an unauthenticated endpoint.
+    """
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    expected = f"Bearer {MCP_TOKEN}"
+
+    class RequireToken(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            presented = request.headers.get("authorization", "")
+            # compare_digest: constant-time, so the token can't be guessed byte-by-byte
+            if not secrets.compare_digest(presented, expected):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(RequireToken)
+
+    config = uvicorn.Config(app, host=HTTP_HOST, port=HTTP_PORT, log_level="error")
+    await uvicorn.Server(config).serve()
+
+
 async def _main() -> None:
     try:
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(sig, lambda: loop.create_task(_on_signal()))
+
+        if HTTP_MODE and not MCP_TOKEN:
+            print(
+                "Refusing to start: --http needs TELEGRAM_MCP_TOKEN in .env.\n"
+                "An unauthenticated localhost port would let any process on this machine\n"
+                "read and send Telegram as you.",
+                file=sys.stderr,
+            )
+            os._exit(1)
 
         acquire_session_lock()
 
@@ -3955,10 +4010,14 @@ async def _main() -> None:
                 # ALWAYS. A waiter that never wakes is what hid this for three months.
                 client_ready.set()
 
-        print("Running MCP server (Telegram client connecting in background)...", file=sys.stderr)
+        where = f"http://{HTTP_HOST}:{HTTP_PORT}/mcp (shared daemon)" if HTTP_MODE else "stdio"
+        print(
+            f"Running MCP server on {where} (Telegram client connecting in background)...",
+            file=sys.stderr,
+        )
         await asyncio.gather(
             _start_client(),
-            mcp.run_stdio_async(),
+            _run_http() if HTTP_MODE else mcp.run_stdio_async(),
         )
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
