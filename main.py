@@ -3936,13 +3936,19 @@ async def _run_http() -> None:
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.responses import JSONResponse
 
-    expected = f"Bearer {MCP_TOKEN}"
-
     class RequireToken(BaseHTTPMiddleware):
         async def dispatch(self, request, call_next):
-            presented = request.headers.get("authorization", "")
-            # compare_digest: constant-time, so the token can't be guessed byte-by-byte
-            if not secrets.compare_digest(presented, expected):
+            # Accept the token from the header OR the query string. Whether a given MCP
+            # client forwards custom headers is not something to bet the whole setup on —
+            # if it doesn't, every window loses Telegram at once. The query form is known
+            # to work here (educateme-lms already authenticates that way).
+            # compare_digest: constant-time, so the token can't be guessed byte-by-byte.
+            header = request.headers.get("authorization", "")
+            query = request.query_params.get("token", "")
+            ok = secrets.compare_digest(header, f"Bearer {MCP_TOKEN}") or (
+                query and secrets.compare_digest(query, MCP_TOKEN)
+            )
+            if not ok:
                 return JSONResponse({"error": "unauthorized"}, status_code=401)
             return await call_next(request)
 
