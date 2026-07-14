@@ -104,10 +104,15 @@ lock_holder_pid = None  # who owns it, so a loser can name them in its error
 client_ready = asyncio.Event()
 startup_error: Optional[Exception] = None
 
+# Absolute, self-locating, and runnable from any shell. The previous wording here said
+# `cd 00-core/... && uv run ...` — a relative path plus a binary that is NOT on the login
+# shell's PATH. Nobody could act on it, which is a large part of why this server stayed
+# broken for three months. A recovery instruction you cannot run is not an instruction.
 SESSION_INVALID_MESSAGE = (
-    "Telegram session is invalid or revoked. Regenerate it:\n"
-    "  cd 00-core/mcp-servers/telegram && uv run python session_string_generator.py\n"
-    "then put the new value in TELEGRAM_SESSION_STRING (.env) and restart the editor."
+    "Telegram session is invalid or revoked. Fix it with one command, from any terminal:\n"
+    f"  bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reauth.sh')}\n"
+    "It asks for your phone + the code Telegram sends, writes the new key into .env, and\n"
+    "verifies it. Then fully quit and reopen the editor."
 )
 
 
@@ -259,10 +264,7 @@ async def ensure_connected():
     try:
         await asyncio.wait_for(client.connect(), timeout=5.0)
         if not await client.is_user_authorized():
-            raise ConnectionError(
-                "Telegram session expired. Regenerate with: "
-                "python session_string_generator.py"
-            )
+            raise ConnectionError(SESSION_INVALID_MESSAGE)
         print("Telegram client reconnected successfully.", file=sys.stderr)
     except asyncio.TimeoutError:
         raise ConnectionError("Telegram reconnect timeout (5s)")
