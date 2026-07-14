@@ -3891,12 +3891,28 @@ async def _graceful_shutdown():
         print(f"Error during shutdown: {e}", file=sys.stderr)
 
 
+async def _on_signal() -> None:
+    """SIGTERM/SIGINT must actually STOP the process.
+
+    The old handler only ran `_graceful_shutdown()` — which disconnects Telethon and
+    returns. `mcp.run_stdio_async()` then went right on awaiting, so the server ignored
+    SIGTERM entirely and simply accumulated: eight stale instances had piled up across
+    two days before anyone noticed, and only SIGKILL would clear them. Piled-up
+    concurrent clients sharing one auth key is precisely what got the key revoked.
+
+    `os._exit`, not `sys.exit`: SystemExit cannot kill this process — interpreter
+    shutdown blocks forever joining anyio's non-daemon stdin worker threads.
+    """
+    await _graceful_shutdown()
+    os._exit(0)
+
+
 async def _main() -> None:
     try:
         # Register signal handlers for graceful shutdown
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(sig, lambda: loop.create_task(_graceful_shutdown()))
+            loop.add_signal_handler(sig, lambda: loop.create_task(_on_signal()))
 
         acquire_session_lock()
 
