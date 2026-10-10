@@ -3,10 +3,13 @@ import os
 import sys
 import json
 import time
+import fcntl
+import secrets
 import asyncio
 import sqlite3
 import logging
 import mimetypes
+import signal
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import List, Dict, Optional, Union, Any
@@ -44,6 +47,14 @@ from telethon.tl.types import (
 import re
 from functools import wraps
 import telethon.errors.rpcerrorlist
+
+# Local rate limiters: DELETE (aggressive) + GET (defense-in-depth)
+# See rate_limiter.py docstring for strategy.
+from rate_limiter import (
+    delete_rate_limited,
+    get_rate_limited,
+    get_rate_limit_status,
+)
 
 
 class ValidationError(Exception):
@@ -96,6 +107,21 @@ TELEGRAM_SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME")
 # Check if a string session exists in environment, otherwise use file-based session
 SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
+# === Transport ===
+#
+# stdio (default) gives every editor window its OWN process — and Telegram revokes an
+# auth key the moment two clients share one session ("cannot be shared between multiple
+# clients, even on the same machine" — Telethon FAQ). So with stdio only one window can
+# hold Telegram at a time.
+#
+# `--http` runs this as a single shared daemon on localhost instead: ONE process, ONE
+# Telethon client, and every window connects to it as a client. Telegram works in all
+# windows at once and there is nothing left to duplicate.
+HTTP_MODE = "--http" in sys.argv
+HTTP_HOST = "127.0.0.1"  # localhost only — never bind 0.0.0.0, this speaks for his account
+HTTP_PORT = int(os.getenv("TELEGRAM_MCP_PORT", "8787"))
+MCP_TOKEN = os.getenv("TELEGRAM_MCP_TOKEN")
+
 mcp = FastMCP("telegram")
 
 if SESSION_STRING:
@@ -105,56 +131,116 @@ else:
     # Use file-based session
     client = TelegramClient(TELEGRAM_SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
 
+# === Session ownership (single-instance guard) ===
+#
+# Claude Code spawns one stdio MCP process per editor window, and every one of them
+# loads the same TELEGRAM_SESSION_STRING. Two Telethon clients sharing one auth key
+# make Telegram revoke that key *permanently* (AuthKeyDuplicatedError) — which is
+# exactly what killed this server in 2026-04. An exclusive flock lets only the first
+# process own the session. The kernel drops the lock when that process dies, so the
+# next window takes over on its own and there is no stale lock to clean up.
+STATE_DIR = os.path.expanduser("~/.cache/telegram-mcp")
+LOCK_PATH = os.path.join(STATE_DIR, "session.lock")
+HEALTH_PATH = os.path.join(STATE_DIR, "health.json")
 
+_lock_file = None  # held open for the process lifetime; closing it frees the lock
+session_owner = False  # True only in the process holding the lock
+lock_holder_pid = None  # who owns it, so a loser can name them in its error
+
+# Released once startup settles — successfully OR not. It must never be left unset:
+# a handler waiting on an event that never fires is what turned a dead session into
+# a silent 30s hang on every tool for three months.
+client_ready = asyncio.Event()
+startup_error: Optional[Exception] = None
+
+# Absolute, self-locating, and runnable from any shell. The previous wording here said
+# `cd 00-core/... && uv run ...` — a relative path plus a binary that is NOT on the login
+# shell's PATH. Nobody could act on it, which is a large part of why this server stayed
+# broken for three months. A recovery instruction you cannot run is not an instruction.
+SESSION_INVALID_MESSAGE = (
+    "Telegram session is invalid or revoked. Fix it with one command, from any terminal:\n"
+    f"  bash {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'reauth.sh')}\n"
+    "It asks for your phone + the code Telegram sends, writes the new key into .env, and\n"
+    "verifies it. Then fully quit and reopen the editor."
+)
+
+
+def actionable(e: Exception) -> Exception:
+    """Attach the remedy to auth failures — the raw cause never says what to do.
+
+    Matched on the class name rather than imported classes: the auth error zoo
+    (AuthKeyDuplicated / AuthKeyUnregistered / SessionRevoked / SessionExpired)
+    moves between Telethon versions, and a stale import would silently stop matching.
+    """
+    name = type(e).__name__
+    if "AuthKey" in name or "Session" in name or "Unauthorized" in name:
+        return RuntimeError(f"{name}: {e}\n\n{SESSION_INVALID_MESSAGE}")
+    return e
+
+
+def not_owner_message() -> str:
+    return (
+        f"Telegram session is owned by another editor window (PID {lock_holder_pid}). "
+        "Telegram allows only one client per auth key — a second connection makes it "
+        "revoke the key permanently. Use Telegram in that window, or close it and "
+        "restart this one."
+    )
+
+
+def acquire_session_lock() -> None:
+    """Take the exclusive session lock if it is free, and record who holds it."""
+    global _lock_file, session_owner, lock_holder_pid
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    _lock_file = os.fdopen(os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644), "r+")
+    try:
+        fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        session_owner = False
+        _lock_file.seek(0)
+        lock_holder_pid = _lock_file.read().strip() or "unknown"
+        print(f"Telegram session owned by PID {lock_holder_pid}; "
+              "serving tools in read-only-error mode.", file=sys.stderr)
+        return
+
+    session_owner = True
+    lock_holder_pid = os.getpid()
+    _lock_file.seek(0)
+    _lock_file.truncate()
+    _lock_file.write(str(os.getpid()))
+    _lock_file.flush()
+
+
+def write_health(ok: bool, error: Optional[str] = None) -> None:
+    """Publish readiness so the SessionStart probe can tell 'idle' from 'broken'.
+
+    The probe classifies MCP servers by log mtime — which a server with dead auth
+    satisfies just as well as a healthy one. That blind spot is why this outage went
+    unnoticed for months. Only the session owner reports; the other windows are
+    disconnected by design and would otherwise raise false alarms.
+    """
+    if not session_owner:
+        return
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(HEALTH_PATH, "w") as f:
+            json.dump(
+                {
+                    "ok": ok,
+                    "error": error,
+                    "pid": os.getpid(),
+                    "checked_at": datetime.now().isoformat(timespec="seconds"),
+                },
+                f,
+            )
+    except Exception as e:
+        print(f"WARNING: could not write health file: {e}", file=sys.stderr)
+
+# Live-ping state (from upstream): is_connected() can report True on a dead TCP socket,
+# so a tool call older than _CONN_VERIFY_INTERVAL first proves the link with a cheap RPC.
 _last_conn_verified: float = 0.0
 _CONN_VERIFY_INTERVAL: float = 30.0  # seconds between live pings
-
-
-async def _force_reconnect():
-    """Force disconnect + reconnect regardless of is_connected() state."""
-    global _last_conn_verified
-    reconnect_logger = logging.getLogger("telegram_mcp")
-    reconnect_logger.warning("Forcing reconnect...")
-    try:
-        await client.disconnect()
-    except Exception:
-        pass
-    await client.connect()
-    if not await client.is_user_authorized():
-        reconnect_logger.warning("Client not authorized after reconnect, calling start()...")
-        await client.start()
-    _last_conn_verified = time.time()
-    reconnect_logger.warning("Forced reconnect successful")
-
-
-async def ensure_connected():
-    """Verify Telegram connection is alive, reconnect if needed.
-
-    is_connected() can return True when the underlying TCP socket is dead.
-    We periodically send a lightweight request to verify the connection
-    actually works, and force-reconnect on any failure.
-    """
-    global _last_conn_verified
-
-    if not client.is_connected():
-        await _force_reconnect()
-        return
-
-    # Skip verification if recently confirmed alive
-    now = time.time()
-    if now - _last_conn_verified < _CONN_VERIFY_INTERVAL:
-        return
-
-    # Verify with a lightweight Telegram API call
-    try:
-        await asyncio.wait_for(
-            client(functions.help.GetNearestDcRequest()),
-            timeout=5.0,
-        )
-        _last_conn_verified = now
-    except (ConnectionError, OSError, asyncio.TimeoutError, Exception):
-        await _force_reconnect()
-
+_reconnect_lock = asyncio.Lock()  # concurrent HTTP callers must not reconnect in parallel
 
 # Setup robust logging with both file and console output
 logger = logging.getLogger("telegram_mcp")
@@ -193,6 +279,118 @@ except Exception as log_error:
     # Fallback to console-only logging
     logger.addHandler(console_handler)
     logger.error(f"Failed to set up log file handler: {log_error}")
+
+
+# === Auto-reconnection logic ===
+
+async def ensure_connected():
+    """Ensure the Telethon client is connected. Reconnect if needed.
+
+    Fails fast and explains itself. Every path out of here either returns connected
+    or raises a ConnectionError a human can act on — never blocks indefinitely.
+    """
+    # We don't hold the session lock: never open a second MTProto connection on the
+    # same auth key. That is the precise thing that got the key revoked.
+    if not session_owner:
+        raise ConnectionError(not_owner_message())
+
+    # Fast path: connected and recently proven alive
+    if client.is_connected():
+        await _verify_live_connection()
+        return
+
+    # Startup phase: wait for startup to settle. It always settles — `_start_client`
+    # sets the event in a `finally`, success or failure.
+    if not client_ready.is_set():
+        try:
+            await asyncio.wait_for(client_ready.wait(), timeout=30.0)
+        except asyncio.TimeoutError:
+            raise ConnectionError("Telegram client startup timeout (30s)")
+
+    # Startup settled but failed (revoked session, no network, ...). Say so now
+    # rather than letting the caller retry into a wall.
+    if startup_error is not None:
+        raise ConnectionError(str(startup_error))
+
+    if client.is_connected():
+        return
+
+    # Post-startup reconnect path
+    print("Telegram client disconnected. Reconnecting...", file=sys.stderr)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=5.0)
+        if not await client.is_user_authorized():
+            raise ConnectionError(SESSION_INVALID_MESSAGE)
+        print("Telegram client reconnected successfully.", file=sys.stderr)
+    except asyncio.TimeoutError:
+        raise ConnectionError("Telegram reconnect timeout (5s)")
+    except ConnectionError:
+        raise
+    except Exception as e:
+        raise ConnectionError(f"Failed to reconnect to Telegram: {e}")
+
+
+async def _verify_live_connection() -> None:
+    """Upstream's dead-socket check, adapted: reconnect the SAME client, never start().
+
+    Upstream called client.start() after a forced reconnect; start() prompts for a phone
+    on stdin, which in this server is the JSON-RPC pipe (stdio) or nothing (daemon). And
+    nothing here ever creates a second TelegramClient — one session, one client.
+    """
+    global _last_conn_verified
+    if time.time() - _last_conn_verified < _CONN_VERIFY_INTERVAL:
+        return
+    try:
+        await asyncio.wait_for(client(functions.help.GetNearestDcRequest()), timeout=5.0)
+        _last_conn_verified = time.time()
+        return
+    except Exception as e:
+        print(f"Live ping failed ({type(e).__name__}); forcing reconnect...", file=sys.stderr)
+    async with _reconnect_lock:
+        if time.time() - _last_conn_verified < _CONN_VERIFY_INTERVAL:
+            return  # another caller reconnected while we waited
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(client.connect(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise ConnectionError("Telegram reconnect timeout (10s)")
+        if not await client.is_user_authorized():
+            raise ConnectionError(SESSION_INVALID_MESSAGE)
+        _last_conn_verified = time.time()
+        print("Forced reconnect successful.", file=sys.stderr)
+
+
+def auto_reconnect(func):
+    """Decorator to ensure Telegram connection before tool calls."""
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        await ensure_connected()
+        try:
+            return await func(*args, **kwargs)
+        except ConnectionError:
+            # A retry only helps a dropped connection. If the session is unusable —
+            # revoked, or owned by another window — retrying just doubles the wait.
+            if not session_owner or startup_error is not None:
+                raise
+            await ensure_connected()
+            return await func(*args, **kwargs)
+    return wrapper
+
+
+async def _keepalive():
+    """Periodic connection check to prevent idle disconnection."""
+    while True:
+        await asyncio.sleep(300)  # every 5 minutes
+        try:
+            if not client.is_connected():
+                print("Keepalive: reconnecting...", file=sys.stderr)
+                await client.connect()
+                print("Keepalive: reconnected.", file=sys.stderr)
+        except Exception as e:
+            print(f"Keepalive: reconnection failed: {e}", file=sys.stderr)
 
 
 # File-path tool security configuration
@@ -454,6 +652,33 @@ def format_message(message) -> Dict[str, Any]:
         result["media_type"] = type(message.media).__name__
 
     return result
+
+
+def get_media_tag(message) -> str:
+    """One word naming the media kind, for list rows: photo | voice | video_note | video |
+    document(<mime>) | sticker | other. Empty string when the message has no media.
+    Added 2026-09-16 for the diary intake — a caption-less photo used to be indistinguishable
+    from a voice note (both printed as "[Media/No text]")."""
+    media = getattr(message, "media", None)
+    if not media:
+        return ""
+    if type(media).__name__ == "MessageMediaPhoto":
+        return "photo"
+    if type(media).__name__ == "MessageMediaDocument":
+        doc = getattr(media, "document", None)
+        mime = getattr(doc, "mime_type", "") or ""
+        for attr in getattr(doc, "attributes", []) or []:
+            name = type(attr).__name__
+            if name == "DocumentAttributeAudio" and getattr(attr, "voice", False):
+                return "voice"
+            if name == "DocumentAttributeVideo" and getattr(attr, "round_message", False):
+                return "video_note"
+            if name == "DocumentAttributeSticker":
+                return "sticker"
+        if mime.startswith("video/"):
+            return "video"
+        return f"document({mime})" if mime else "document"
+    return "other"
 
 
 def get_sender_name(message) -> str:
@@ -760,6 +985,8 @@ def _configure_allowed_roots_from_cli(argv: Optional[List[str]] = None) -> None:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chats", openWorldHint=True, readOnlyHint=True))
+@get_rate_limited
+@auto_reconnect
 async def get_chats(page: int = 1, page_size: int = 20) -> str:
     """
     Get a paginated list of chats.
@@ -788,6 +1015,8 @@ async def get_chats(page: int = 1, page_size: int = 20) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Messages", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@get_rate_limited
+@auto_reconnect
 async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int = 20) -> str:
     """
     Get paginated messages from a specific chat.
@@ -826,8 +1055,12 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
     annotations=ToolAnnotations(title="Send Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def send_message(
-    chat_id: Union[int, str], message: str, parse_mode: Optional[str] = None
+    chat_id: Union[int, str],
+    message: str,
+    parse_mode: Optional[str] = None,
+    schedule_in_seconds: int = 0,
 ) -> str:
     """
     Send a message to a specific chat.
@@ -837,9 +1070,16 @@ async def send_message(
         parse_mode: Optional formatting mode. Use 'html' for HTML tags (<b>, <i>, <code>, <pre>,
             <a href="...">), 'md' or 'markdown' for Markdown (**bold**, __italic__, `code`,
             ```pre```), or omit for plain text (no formatting).
+        schedule_in_seconds: Optional. If > 0, the message is scheduled that many seconds ahead
+            instead of sent now. In Saved Messages a scheduled message is a Telegram "Reminder",
+            the only self-message that triggers a push notification (plain self-messages never do).
     """
     try:
         entity = await resolve_entity(chat_id)
+        if schedule_in_seconds and schedule_in_seconds > 0:
+            when = datetime.utcnow() + timedelta(seconds=int(schedule_in_seconds))
+            await client.send_message(entity, message, parse_mode=parse_mode, schedule=when)
+            return f"Message scheduled for {when.isoformat()}Z."
         await client.send_message(entity, message, parse_mode=parse_mode)
         return "Message sent successfully."
     except Exception as e:
@@ -954,6 +1194,7 @@ async def list_inline_buttons(
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def press_inline_button(
     chat_id: Union[int, str],
     message_id: Optional[Union[int, str]] = None,
@@ -1094,6 +1335,7 @@ async def press_inline_button(
 @mcp.tool(
     annotations=ToolAnnotations(title="List Contacts", openWorldHint=True, readOnlyHint=True)
 )
+@auto_reconnect
 async def list_contacts() -> str:
     """
     List all contacts in your Telegram account.
@@ -1172,6 +1414,8 @@ async def get_contact_ids() -> str:
     annotations=ToolAnnotations(title="List Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
+@auto_reconnect
 async def list_messages(
     chat_id: Union[int, str],
     limit: int = 20,
@@ -1285,9 +1529,11 @@ async def list_messages(
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
 
             engagement_info = get_engagement_info(msg)
+            media_tag = get_media_tag(msg)
+            media_info = f" | media: {media_tag}" if media_tag else ""
 
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info} | Message: {message_text}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info}{media_info} | Message: {message_text}"
             )
 
         return "\n".join(lines)
@@ -1383,6 +1629,8 @@ async def list_topics(
 
 
 @mcp.tool(annotations=ToolAnnotations(title="List Chats", openWorldHint=True, readOnlyHint=True))
+@get_rate_limited
+@auto_reconnect
 async def list_chats(
     chat_type: str = None, limit: int = 20, unread_only: bool = False, unmuted_only: bool = False
 ) -> str:
@@ -1484,6 +1732,7 @@ async def list_chats(
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Chat", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def get_chat(chat_id: Union[int, str]) -> str:
     """
     Get detailed information about a specific chat.
@@ -1714,6 +1963,7 @@ async def get_last_interaction(contact_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Message Context", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 async def get_message_context(
     chat_id: Union[int, str], message_id: int, context_size: int = 3
 ) -> str:
@@ -1939,6 +2189,7 @@ async def delete_contact(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@auto_reconnect
 async def block_user(user_id: Union[int, str]) -> str:
     """
     Block a user by user ID.
@@ -1959,6 +2210,7 @@ async def block_user(user_id: Union[int, str]) -> str:
     )
 )
 @validate_id("user_id")
+@auto_reconnect
 async def unblock_user(user_id: Union[int, str]) -> str:
     """
     Unblock a user by user ID.
@@ -1974,6 +2226,7 @@ async def unblock_user(user_id: Union[int, str]) -> str:
 
 
 @mcp.tool(annotations=ToolAnnotations(title="Get Me", openWorldHint=True, readOnlyHint=True))
+@auto_reconnect
 async def get_me() -> str:
     """
     Get your own user information.
@@ -2107,6 +2360,7 @@ async def invite_to_group(group_id: Union[int, str], user_ids: List[Union[int, s
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def leave_chat(chat_id: Union[int, str]) -> str:
     """
     Leave a group or channel by chat ID.
@@ -2190,6 +2444,8 @@ async def leave_chat(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Participants", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
+@auto_reconnect
 async def get_participants(chat_id: Union[int, str]) -> str:
     """
     List all participants in a group or channel.
@@ -2210,6 +2466,7 @@ async def get_participants(chat_id: Union[int, str]) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @validate_id("chat_id")
+@auto_reconnect
 async def send_file(
     chat_id: Union[int, str],
     file_path: str,
@@ -2244,6 +2501,7 @@ async def send_file(
     annotations=ToolAnnotations(title="Download Media", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
 async def download_media(
     chat_id: Union[int, str],
     message_id: int,
@@ -3001,6 +3259,7 @@ async def get_invite_link(chat_id: Union[int, str]) -> str:
         title="Join Chat By Link", openWorldHint=True, destructiveHint=True, idempotentHint=True
     )
 )
+@auto_reconnect
 async def join_chat_by_link(link: str) -> str:
     """
     Join a chat by invite link.
@@ -3223,6 +3482,7 @@ async def upload_file(file_path: str, ctx: Optional[Context] = None) -> str:
     annotations=ToolAnnotations(title="Forward Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("from_chat_id", "to_chat_id")
+@auto_reconnect
 async def forward_message(
     from_chat_id: Union[int, str], message_id: int, to_chat_id: Union[int, str]
 ) -> str:
@@ -3250,6 +3510,7 @@ async def forward_message(
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str) -> str:
     """
     Edit a message you sent.
@@ -3270,6 +3531,8 @@ async def edit_message(chat_id: Union[int, str], message_id: int, new_text: str)
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
+@delete_rate_limited
 async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Delete a message by ID.
@@ -3288,6 +3551,7 @@ async def delete_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Pin a message in a chat.
@@ -3306,6 +3570,7 @@ async def pin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     """
     Unpin a message in a chat.
@@ -3324,6 +3589,7 @@ async def unpin_message(chat_id: Union[int, str], message_id: int) -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def mark_as_read(chat_id: Union[int, str]) -> str:
     """
     Mark all messages as read in a chat.
@@ -3340,6 +3606,7 @@ async def mark_as_read(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Reply To Message", openWorldHint=True, destructiveHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def reply_to_message(
     chat_id: Union[int, str], message_id: int, text: str, parse_mode: Optional[str] = None
 ) -> str:
@@ -3407,6 +3674,8 @@ async def search_public_chats(query: str, limit: int = 20) -> str:
     annotations=ToolAnnotations(title="Search Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@get_rate_limited
+@auto_reconnect
 async def search_messages(chat_id: Union[int, str], query: str, limit: int = 20) -> str:
     """
     Search for messages in a chat by text.
@@ -3876,6 +4145,8 @@ async def set_bot_commands(bot_username: str, commands: list) -> str:
 
 @mcp.tool(annotations=ToolAnnotations(title="Get History", openWorldHint=True, readOnlyHint=True))
 @validate_id("chat_id")
+@get_rate_limited
+@auto_reconnect
 async def get_history(chat_id: Union[int, str], limit: int = 100) -> str:
     """
     Get full chat history (up to limit).
@@ -3967,6 +4238,7 @@ async def get_recent_actions(chat_id: Union[int, str]) -> str:
     annotations=ToolAnnotations(title="Get Pinned Messages", openWorldHint=True, readOnlyHint=True)
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def get_pinned_messages(chat_id: Union[int, str]) -> str:
     """
     Get all pinned messages in a chat.
@@ -4341,6 +4613,7 @@ async def get_drafts() -> str:
     )
 )
 @validate_id("chat_id")
+@auto_reconnect
 async def clear_draft(chat_id: Union[int, str]) -> str:
     """
     Clear/delete a draft from a specific chat.
@@ -4937,20 +5210,201 @@ async def reorder_folders(folder_ids: List[int]) -> str:
         )
 
 
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Delete Rate Limit Status", openWorldHint=False, readOnlyHint=True
+    )
+)
+async def rate_limit_status() -> str:
+    """
+    Get current delete rate limiting status.
+
+    Shows how many delete operations have been performed in the last minute.
+    Rate limiting only applies to DELETE operations to protect against account blocks.
+
+    When limit is reached, operations automatically WAIT and continue (never fail).
+    """
+    try:
+        status = await get_rate_limit_status()
+        d = status["delete"]
+        g = status["get"]
+
+        lines = ["📊 Rate Limit Status (DELETE + GET)", ""]
+
+        lines.append("--- DELETE (aggressive, account-protection) ---")
+        lines.append(
+            f"Last minute: {d['deletes_last_minute']}/{d['limit_per_minute']} "
+            f"({d['percent_used']})"
+        )
+        lines.append(
+            f"Session: {d['total_deletes_session']} deletes, "
+            f"{d['total_waits_session']} waits"
+        )
+        lines.append(
+            f"Config: max {d['config']['deletes_per_minute']}/min, "
+            f"{d['config']['delete_delay']}s between, "
+            f"batch {d['config']['max_batch_size']}"
+        )
+        lines.append("")
+
+        lines.append("--- GET (defense-in-depth, runaway-loop guard) ---")
+        lines.append(
+            f"Last minute: {g['calls_last_minute']}/{g['limit_per_minute']} "
+            f"({g['percent_used']})"
+        )
+        lines.append(
+            f"Session: {g['total_calls_session']} calls, "
+            f"{g['total_waits_session']} waits"
+        )
+        lines.append(
+            f"Config: max {g['config']['calls_per_minute']}/min, "
+            f"approach delay {g['config']['approach_delay']}s"
+        )
+        lines.append("")
+        lines.append("Note: Rate limiting waits automatically, never fails.")
+        lines.append("Telethon FloodWaitError is the primary defense for reads.")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error getting rate limit status: {e}"
+
+
+async def _graceful_shutdown():
+    """Disconnect Telethon client cleanly on exit."""
+    try:
+        if client.is_connected():
+            print("Shutting down Telegram client...", file=sys.stderr)
+            await client.disconnect()
+            print("Telegram client disconnected.", file=sys.stderr)
+    except Exception as e:
+        print(f"Error during shutdown: {e}", file=sys.stderr)
+
+
+async def _on_signal() -> None:
+    """SIGTERM/SIGINT must actually STOP the process.
+
+    The old handler only ran `_graceful_shutdown()` — which disconnects Telethon and
+    returns. `mcp.run_stdio_async()` then went right on awaiting, so the server ignored
+    SIGTERM entirely and simply accumulated: eight stale instances had piled up across
+    two days before anyone noticed, and only SIGKILL would clear them. Piled-up
+    concurrent clients sharing one auth key is precisely what got the key revoked.
+
+    `os._exit`, not `sys.exit`: SystemExit cannot kill this process — interpreter
+    shutdown blocks forever joining anyio's non-daemon stdin worker threads.
+    """
+    await _graceful_shutdown()
+    os._exit(0)
+
+
+async def _run_http() -> None:
+    """Serve MCP over localhost HTTP, so every editor window shares ONE Telethon client.
+
+    Mirrors FastMCP.run_streamable_http_async() — which builds the app internally and so
+    leaves no seam for middleware — with a bearer-token gate added. stdio is reachable
+    only by the process that spawned it; an open localhost port is reachable by anything
+    running on this machine, and these tools read and send his Telegram. The token is
+    not optional: refuse to serve rather than stand up an unauthenticated endpoint.
+    """
+    import uvicorn
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from starlette.responses import JSONResponse
+
+    class RequireToken(BaseHTTPMiddleware):
+        async def dispatch(self, request, call_next):
+            # Accept the token from the header OR the query string. Whether a given MCP
+            # client forwards custom headers is not something to bet the whole setup on —
+            # if it doesn't, every window loses Telegram at once. The query form is known
+            # to work here (educateme-lms already authenticates that way).
+            # compare_digest: constant-time, so the token can't be guessed byte-by-byte.
+            header = request.headers.get("authorization", "")
+            query = request.query_params.get("token", "")
+            ok = secrets.compare_digest(header, f"Bearer {MCP_TOKEN}") or (
+                query and secrets.compare_digest(query, MCP_TOKEN)
+            )
+            if not ok:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+            return await call_next(request)
+
+    app = mcp.streamable_http_app()
+    app.add_middleware(RequireToken)
+
+    config = uvicorn.Config(app, host=HTTP_HOST, port=HTTP_PORT, log_level="error")
+    await uvicorn.Server(config).serve()
+
+
 async def _main() -> None:
     try:
-        # Start the Telethon client non-interactively
-        print("Starting Telegram client...", file=sys.stderr)
-        await client.start()
+        # Register signal handlers for graceful shutdown
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, lambda: loop.create_task(_on_signal()))
 
-        # Warm entity cache — StringSession has no persistent cache,
-        # so fetch all dialogs once to populate it
-        print("Warming entity cache...", file=sys.stderr)
-        await client.get_dialogs()
+        if HTTP_MODE and not MCP_TOKEN:
+            print(
+                "Refusing to start: --http needs TELEGRAM_MCP_TOKEN in .env.\n"
+                "An unauthenticated localhost port would let any process on this machine\n"
+                "read and send Telegram as you.",
+                file=sys.stderr,
+            )
+            os._exit(1)
 
-        print("Telegram client started. Running MCP server...", file=sys.stderr)
-        # Use the asynchronous entrypoint instead of mcp.run()
-        await mcp.run_stdio_async()
+        acquire_session_lock()
+
+        # Start MCP stdio handler concurrently with Telethon client so the MCP
+        # `initialize` handshake is never blocked behind the MTProto connect.
+        async def _start_client() -> None:
+            """Connect Telethon, or record why we couldn't. Never raises.
+
+            Raising here would propagate through `asyncio.gather` and take the whole
+            MCP server down. Instead we record the failure, publish it, and release
+            `client_ready` so every tool reports it instantly.
+            """
+            global startup_error
+            try:
+                if not session_owner:
+                    raise RuntimeError(not_owner_message())
+
+                print("Starting Telegram client...", file=sys.stderr)
+                # connect(), never start(): start()'s default `phone=` is
+                # `lambda: input(...)`, and stdin here is the JSON-RPC pipe. An
+                # interactive prompt would block the event loop and corrupt the
+                # protocol stream — every tool, even ones that never touch Telegram.
+                await asyncio.wait_for(client.connect(), timeout=30.0)
+                if not await client.is_user_authorized():
+                    raise RuntimeError(SESSION_INVALID_MESSAGE)
+
+                # Warm the entity cache (upstream): StringSession keeps none, and a cold
+                # cache makes the first get_entity on a group ID fail. Non-fatal.
+                try:
+                    await client.get_dialogs()
+                except Exception as e:
+                    print(f"Entity cache warm-up failed (non-fatal): {e}", file=sys.stderr)
+
+                print("Telegram client started.", file=sys.stderr)
+                write_health(ok=True)
+                asyncio.create_task(_keepalive())
+            except Exception as e:
+                startup_error = actionable(e)
+                write_health(ok=False, error=f"{type(e).__name__}: {e}")
+                print(
+                    "\n***** TELEGRAM MCP: NOT CONNECTED — ALL TELEGRAM TOOLS WILL FAIL *****\n"
+                    f"***** {type(e).__name__}: {e}\n"
+                    "**********************************************************************\n",
+                    file=sys.stderr,
+                )
+            finally:
+                # ALWAYS. A waiter that never wakes is what hid this for three months.
+                client_ready.set()
+
+        where = f"http://{HTTP_HOST}:{HTTP_PORT}/mcp (shared daemon)" if HTTP_MODE else "stdio"
+        print(
+            f"Running MCP server on {where} (Telegram client connecting in background)...",
+            file=sys.stderr,
+        )
+        await asyncio.gather(
+            _start_client(),
+            _run_http() if HTTP_MODE else mcp.run_stdio_async(),
+        )
     except Exception as e:
         print(f"Error starting client: {e}", file=sys.stderr)
         if isinstance(e, sqlite3.OperationalError) and "database is locked" in str(e):
@@ -4958,12 +5412,16 @@ async def _main() -> None:
                 "Database lock detected. Please ensure no other instances are running.",
                 file=sys.stderr,
             )
-        sys.exit(1)
+        sys.stderr.flush()
+        await _graceful_shutdown()
+        # os._exit, never sys.exit. SystemExit cannot kill this process: interpreter
+        # shutdown blocks forever in threading._shutdown() joining anyio's non-daemon
+        # stdin workers, leaving a zombie whose event loop is dead but whose pipe is
+        # still open — so the MCP client goes on believing the server is healthy and
+        # every tool call just times out. That zombie was the three-month outage.
+        os._exit(1)
     finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
+        await _graceful_shutdown()
 
 
 def main() -> None:
