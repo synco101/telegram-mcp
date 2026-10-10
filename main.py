@@ -508,6 +508,33 @@ def format_message(message) -> Dict[str, Any]:
     return result
 
 
+def get_media_tag(message) -> str:
+    """One word naming the media kind, for list rows: photo | voice | video_note | video |
+    document(<mime>) | sticker | other. Empty string when the message has no media.
+    Added 2026-09-16 for the diary intake — a caption-less photo used to be indistinguishable
+    from a voice note (both printed as "[Media/No text]")."""
+    media = getattr(message, "media", None)
+    if not media:
+        return ""
+    if type(media).__name__ == "MessageMediaPhoto":
+        return "photo"
+    if type(media).__name__ == "MessageMediaDocument":
+        doc = getattr(media, "document", None)
+        mime = getattr(doc, "mime_type", "") or ""
+        for attr in getattr(doc, "attributes", []) or []:
+            name = type(attr).__name__
+            if name == "DocumentAttributeAudio" and getattr(attr, "voice", False):
+                return "voice"
+            if name == "DocumentAttributeVideo" and getattr(attr, "round_message", False):
+                return "video_note"
+            if name == "DocumentAttributeSticker":
+                return "sticker"
+        if mime.startswith("video/"):
+            return "video"
+        return f"document({mime})" if mime else "document"
+    return "other"
+
+
 def get_sender_name(message) -> str:
     """Helper function to get sender name from a message."""
     if not message.sender:
@@ -613,15 +640,22 @@ async def get_messages(chat_id: Union[int, str], page: int = 1, page_size: int =
 )
 @validate_id("chat_id")
 @auto_reconnect
-async def send_message(chat_id: Union[int, str], message: str) -> str:
+async def send_message(chat_id: Union[int, str], message: str, schedule_in_seconds: int = 0) -> str:
     """
     Send a message to a specific chat.
     Args:
         chat_id: The ID or username of the chat.
         message: The message content to send.
+        schedule_in_seconds: Optional. If > 0, the message is scheduled that many seconds ahead
+            instead of sent now. In Saved Messages a scheduled message is a Telegram "Reminder",
+            the only self-message that triggers a push notification (plain self-messages never do).
     """
     try:
         entity = await client.get_entity(chat_id)
+        if schedule_in_seconds and schedule_in_seconds > 0:
+            when = datetime.utcnow() + timedelta(seconds=int(schedule_in_seconds))
+            await client.send_message(entity, message, schedule=when)
+            return f"Message scheduled for {when.isoformat()}Z."
         await client.send_message(entity, message)
         return "Message sent successfully."
     except Exception as e:
@@ -1035,9 +1069,11 @@ async def list_messages(
                 reply_info = f" | reply to {msg.reply_to.reply_to_msg_id}"
 
             engagement_info = get_engagement_info(msg)
+            media_tag = get_media_tag(msg)
+            media_info = f" | media: {media_tag}" if media_tag else ""
 
             lines.append(
-                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info} | Message: {message_text}"
+                f"ID: {msg.id} | {sender_name} | Date: {msg.date}{reply_info}{engagement_info}{media_info} | Message: {message_text}"
             )
 
         return "\n".join(lines)
